@@ -1,0 +1,608 @@
+---
+title: "AFM 423 Final Project"
+author: "Xuntian Lin 20763179"
+output: pdf_document
+date: "2023-04-12"
+---
+
+
+Import the required dataset
+```{r}
+# install.packages("readxl")
+# Load the library
+library("readxl")
+
+# Load the data and modify the column names
+data_ml <- read_excel("data_ml.xlsx")
+# load("data_ml.RData")
+colnames(data_ml)[2] <- "date"
+```
+
+
+```{r}
+
+# install.packages("glmnet")
+library(glmnet)
+library(dplyr)
+library(tidyverse)
+library(lubridate)
+
+data_ml <- data_ml %>% 
+    filter(date > "1999-12-31",         # Keep the date with sufficient data points
+           date < "2019-01-01") %>%
+    mutate(LMH = Mkt_Cap_3M_Usd / Share_Turn_3M) %>%
+    arrange(stock_id, date)             # Order the data
+
+# List of features of data_ml (i.e. column names)
+features <- colnames(data_ml[3:95])   # Keep the feature's column names
+
+stock_ids <- levels(as.factor(data_ml$stock_id)) # A list of all stock_ids
+stock_days <- data_ml %>%                        # Compute the number of data points per stock
+    group_by(stock_id) %>% summarize(nb = n()) 
+stock_ids_short <- stock_ids[which(stock_days$nb == max(stock_days$nb))] # Stocks with full data
+
+returns <- data_ml %>%                           # Compute returns, in matrix format, in 3 steps:
+    filter(stock_id %in% stock_ids) %>%    # 1. Filtering the data
+    dplyr::select(date, stock_id, R1M_Usd) %>%   # 2. Keep returns along with dates & firm names
+    pivot_wider(names_from = "stock_id", 
+                values_from = "R1M_Usd")         # 3. Put in matrix shape 
+```
+
+
+Load the Fama French 3 factor model dataset
+```{r}
+library(quantmod)
+library(xtable)
+
+min_date <- "1963-07-31"
+max_date <- "2020-03-28"
+
+ff_factors <- read_csv("F-F_Research_Data_Factors.CSV", skip = 3) %>%
+  rename(date = 1, MKT_RF = 'Mkt-RF') %>%
+  mutate_at(vars(-date), as.numeric) %>%
+  mutate(date = ymd(parse_date_time(date, "%Y%m"))) %>%
+  mutate(date = rollback(date + months(1))) #%>%
+  # mutate(monthid = (year(date) - 2000) * 12 + month(date))
+
+
+ff_factors <- ff_factors %>%
+  mutate(MKT_RF = MKT_RF / 100, # Scale returns
+         SMB = SMB / 100,
+         HML = HML / 100,
+         RF = RF/100) %>%
+  filter(date >= min_date, date <= max_date)    # Finally, keep only recent points
+
+knitr::kable(head(ff_factors), booktabs = TRUE,
+caption = "Sample of monthly factor returns.") # A look at the data (see table)
+
+```
+
+
+Visualization of the ff_factors
+```{r}
+ff_factors %>%
+  mutate(date = year(date)) %>%
+  gather(key = factor, value = value, -date) %>%
+  group_by(date, factor) %>%
+  summarise(value = mean(value)) %>%
+  ggplot(aes(x = date, y = value, color = factor)) + 
+  geom_line() + coord_fixed(500) + theme_light()
+```
+
+
+Create extra monthid columns
+```{r}
+#ff_3$monthid <- (year(ff_3$dateff) - 2000) * 12 + month(ff_3$dateff)
+
+ml_returns <-
+  data_ml %>%
+  select(date, stock_id, R1M_Usd) %>%
+  # mutate(monthid = (year(date) - 2000) * 12 + month(date)) %>%
+  left_join(ff_factors, by = "date") %>%
+  mutate(R_excess = R1M_Usd - RF) # %>%
+  # select( -monthid)         # Drop the unnecessary columns here
+```
+
+
+# CAPM Model
+```{r}
+nb_factors <- 1                                                     # Number of factors
+data_FM <- left_join(data_ml %>%                                    # Join the 2 datasets
+                         dplyr::select(date, stock_id, R1M_Usd), # (with returns...
+                         # filter(stock_id %in% stock_ids_short),     # ... over some stocks)
+                     ff_factors, 
+                     by = "date") %>% 
+    group_by(stock_id) %>%                                          # Grouping
+    mutate(R1M_Usd = lag(R1M_Usd)) %>%                              # Lag returns
+    ungroup() %>%
+    na.omit() %>%                                                   # Remove missing points
+    pivot_wider(names_from = "stock_id", values_from = "R1M_Usd")
+
+models <- lapply(paste0("`", stock_ids, 
+                        '` ~  MKT_RF'),           # Model spec
+                 function(f){ lm(as.formula(f), data = data_FM,           # Call lm(.)
+                                 na.action="na.exclude") %>%       
+                         summary() %>%                                    # Gather the output
+                         "$"(coef) %>%                                    # Keep only coefs
+                         data.frame() %>%                                 # Convert to dataframe
+                         dplyr::select(Estimate)}                         # Keep the estimates
+                 )
+betas <- matrix(unlist(models), ncol = nb_factors + 1, byrow = T) %>%     # Extract the betas
+    data.frame(row.names = stock_ids)                               # Format: row names
+colnames(betas) <- c("Constant", "MKT_RF")    # Format: col names
+```
+
+```{r}
+loadings <- betas %>%                            # Start from loadings (betas)
+    dplyr::select(-Constant) %>%                 # Remove constant
+    data.frame()                                 # Convert to dataframe             
+ret <- returns %>%                               # Start from returns
+    dplyr::select(-date) %>%                     # Keep the returns only
+    data.frame(row.names = returns$date) %>%     # Set row names
+    t()                                          # Transpose
+FM_data <- cbind(loadings, ret)                  # Aggregate both
+```
+
+Then we do the second round of regression
+```{r}
+models <- lapply(paste("`", returns$date, "`", ' ~  MKT_RF', sep = ""),
+function(f){ lm(as.formula(f), data = FM_data) %>%                        # Call lm(.)
+                         summary() %>%                                    # Gather the output
+                         "$"(coef) %>%                                    # Keep only the coefs
+                         data.frame() %>%                                 # Convert to dataframe
+                         dplyr::select(Estimate)}                         # Keep only estimates
+                 )
+gammas <- matrix(unlist(models), ncol = nb_factors + 1, byrow = T) %>%    # Switch to dataframe
+    data.frame(row.names = returns$date)                                  # & set row names
+colnames(gammas) <- c("Constant", "MKT_RF")   # Set col names
+```
+
+Visually the gamma
+```{r}
+gammas[2:nrow(gammas),] %>%                                         # Take gammas:
+    # The first row is omitted because the first row of returns is undefined
+    dplyr::select(MKT_RF) %>%                             # Select 3 factors
+    bind_cols(date = data_FM$date) %>%                              # Add date
+    gather(key = factor, value = gamma, -date) %>%                  # Put in tidy shape
+    ggplot(aes(x = date, y = gamma, color = factor)) +              # Plot
+    geom_line() + facet_grid( factor~. ) +                          # Lines & facets
+    scale_color_manual(values=c("#F87E1F", "#0570EA", "#F81F40")) + ylim(-0.5, 0.5) # + # Colors
+    # coord_fixed() + theme_light()                                # Fix x/y ratio
+```
+
+
+# Simple Fama French three factor model
+```{r}
+nb_factors <- 3                                                     # Number of factors
+data_FM <- left_join(data_ml %>%                                    # Join the 2 datasets
+                         dplyr::select(date, stock_id, R1M_Usd), # (with returns...
+                         # filter(stock_id %in% stock_ids_short),     # ... over some stocks)
+                     ff_factors, 
+                     by = "date") %>%
+    group_by(stock_id) %>%                                           # Grouping
+    mutate(R1M_Usd = lag(R1M_Usd)) %>%                              # Lag returns
+    ungroup() %>%
+    na.omit() %>%                                                   # Remove missing points
+    pivot_wider(names_from = "stock_id", values_from = "R1M_Usd")
+
+models <- lapply(paste0("`", stock_ids, 
+                        '` ~  MKT_RF + SMB + HML'),           # Model spec
+                 function(f){ lm(as.formula(f), data = data_FM,           # Call lm(.)
+                                 na.action="na.exclude") %>%       
+                         summary() %>%                                    # Gather the output
+                         "$"(coef) %>%                                    # Keep only coefs
+                         data.frame() %>%                                 # Convert to dataframe
+                         dplyr::select(Estimate)}                         # Keep the estimates
+                 )
+betas <- matrix(unlist(models), ncol = nb_factors + 1, byrow = T) %>%     # Extract the betas
+    data.frame(row.names = stock_ids)                               # Format: row names
+colnames(betas) <- c("Constant", "MKT_RF", "SMB", "HML")    # Format: col names
+```
+
+
+```{r}
+loadings <- betas %>%                            # Start from loadings (betas)
+    dplyr::select(-Constant) %>%                 # Remove constant
+    data.frame()                                 # Convert to dataframe             
+ret <- returns %>%                               # Start from returns
+    dplyr::select(-date) %>%                     # Keep the returns only
+    data.frame(row.names = returns$date) %>%     # Set row names
+    t()                                          # Transpose
+FM_data <- cbind(loadings, ret)                  # Aggregate both
+```
+
+
+Then we do the second round of regression
+```{r}
+models <- lapply(paste("`", returns$date, "`", ' ~  MKT_RF + SMB + HML', sep = ""),
+function(f){ lm(as.formula(f), data = FM_data) %>%                        # Call lm(.)
+                         summary() %>%                                    # Gather the output
+                         "$"(coef) %>%                                    # Keep only the coefs
+                         data.frame() %>%                                 # Convert to dataframe
+                         dplyr::select(Estimate)}                         # Keep only estimates
+                 )
+
+gammas <- matrix(unlist(models), ncol = nb_factors + 1, byrow = T) %>%    # Switch to dataframe
+    data.frame(row.names = returns$date)                                  # & set row names
+colnames(gammas) <- c("Constant", "MKT_RF", "SMB", "HML")   # Set col names
+```
+
+Visually plot the gamma
+```{r}
+gammas[2:nrow(gammas),] %>%                                         # Take gammas:
+    # The first row is omitted because the first row of returns is undefined
+    dplyr::select(MKT_RF, SMB, HML) %>%                             # Select 3 factors
+    bind_cols(date = data_FM$date) %>%                              # Add date
+    gather(key = factor, value = gamma, -date) %>%                  # Put in tidy shape
+    ggplot(aes(x = date, y = gamma, color = factor)) +              # Plot
+    geom_line() + facet_grid( factor~. ) +                          # Lines & facets
+    scale_color_manual(values=c("#F87E1F", "#0570EA", "#F81F40")) #+ # Colors
+    #coord_fixed(980) + theme_light()                                # Fix x/y ratio
+```
+
+
+Calculate the statistics
+```{r}
+
+library(knitr)
+# Gather the main statistics
+stats <-
+  gammas %>%
+  summarise(mean(MKT_RF), mean(SMB), mean(HML), sd(MKT_RF), sd(SMB), sd(HML)) %>%
+  round(3)
+
+stats
+
+# Calculate t-stats
+r <- t.test(gammas$MKT_RF)
+r$statistic
+r <- t.test(gammas$SMB)
+r$statistic
+r <- t.test(gammas$HML)
+r$statistic
+
+# Calculate coefficients
+cor(gammas$MKT_RF, gammas$SMB)
+cor(gammas$MKT_RF, gammas$HML)
+cor(gammas$SMB, gammas$HML)
+```
+
+# Introduce a new factor called LMH based on share_turn_3m
+```{r}
+# First put the portfolio in three ones, L, M and H based on the shares
+ml_returns_siliq <-
+  data_ml %>%
+  select(c("date", "stock_id", "R1M_Usd", "Pb", "Mkt_Cap_3M_Usd", "Share_Turn_3M", "Share_Turn_6M", "Share_Turn_12M"))  %>%
+  group_by(date) %>%
+  mutate(Turn_rank = ntile(Share_Turn_6M, 3)) %>%
+  ungroup()
+
+# Take the weighted mean on the cut portfolios
+siliq_view <-
+  ml_returns_siliq %>%
+  group_by(date, Turn_rank) %>%
+  summarise(turn_rank_ret = mean(R1M_Usd), .groups = 'drop') %>%
+  ungroup()
+  
+
+# Create the new factor
+seliq_lmh <-
+  siliq_view %>%
+  group_by(date) %>%
+  summarise(LMH = turn_rank_ret[Turn_rank==1] - turn_rank_ret[Turn_rank==3] ) %>%
+  mutate_if(is.numeric, round, 4)
+
+siliq_factors <- 
+  left_join(seliq_lmh, ff_factors, by = 'date')
+
+# Plot the new variable LMH
+siliq_factors %>%
+  mutate(date = year(date)) %>%
+  gather(key = factor, value = value, -date) %>%
+  group_by(date, factor) %>%
+  summarise(value = mean(value)) %>%
+  ggplot(aes(x = date, y = value, color = factor)) + 
+  geom_line()  + theme_light()
+```
+
+
+# Normal model ff-3
+```{r}
+ml_returns_ff <-
+  data_ml %>%
+  select(c("date", "stock_id", "R1M_Usd", "Pb", "Mkt_Cap_3M_Usd", "Share_Turn_3M"))  %>%
+  mutate(Bp = 1/Pb) %>%
+  left_join(ff_factors, by = "date") %>%
+  mutate(R_excess = R1M_Usd - RF)
+```
+
+```{r}
+ff_dplyr_byhand <-
+  ml_returns_ff %>%
+  lm(R_excess ~ MKT_RF + SMB + HML, 
+                data = .) %>% 
+  tidy(conf.level = .95, conf.int = T)
+
+ff_dplyr_byhand %>% 
+  mutate_if(is.numeric, funs(round(., 3)))
+
+ff_dplyr_byhand %>% 
+  mutate_if(is.numeric, funs(round(., 3))) %>%
+  filter(term != "(Intercept)") %>% 
+  ggplot(aes(x = term, y = estimate, shape = term, color = term)) + 
+  geom_point() +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high)) +
+  labs(title = "FF 3-Factor Coefficients for Our Portfolio",
+       subtitle = "nothing in this post is investment advice",
+       x = "",
+       y = "coefficient",
+       caption = "data source: Fama French website") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        plot.caption  = element_text(hjust = 0))
+```
+
+
+# Four factor model (SiLiq)
+```{r}
+ml_returns_siliq <-
+  data_ml %>%
+  select(c("date", "stock_id", "R1M_Usd", "Pb", "Mkt_Cap_3M_Usd", "Share_Turn_3M"))  %>%
+  mutate(Bp = 1/Pb) %>%
+  left_join(siliq_factors, by = "date") %>%
+  mutate(R_excess = R1M_Usd - RF)
+```
+
+
+```{r}
+ff_dplyr_byhand <-
+  ml_returns_siliq %>%
+  lm(R_excess ~ MKT_RF + SMB + LMH, 
+                data = .) %>% 
+  tidy(conf.level = .95, conf.int = T)
+
+ff_dplyr_byhand %>% 
+  mutate_if(is.numeric, funs(round(., 3)))
+
+ff_dplyr_byhand %>% 
+  mutate_if(is.numeric, funs(round(., 3))) %>%
+  filter(term != "(Intercept)") %>% 
+  ggplot(aes(x = term, y = estimate, shape = term, color = term)) + 
+  geom_point() +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high)) +
+  labs(title = "FF 3-Factor Coefficients for Our Portfolio",
+       subtitle = "nothing in this post is investment advice",
+       x = "",
+       y = "coefficient",
+       caption = "data source: Fama French website") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        plot.caption  = element_text(hjust = 0))
+```
+
+
+# (DiLiq)
+```{r}
+ff_dplyr_byhand <-
+  ml_returns_siliq %>%
+  lm(R_excess ~ MKT_RF + HML + LMH, 
+                data = .) %>% 
+  tidy(conf.level = .95, conf.int = T)
+
+ff_dplyr_byhand %>% 
+  mutate_if(is.numeric, funs(round(., 3)))
+
+ff_dplyr_byhand %>% 
+  mutate_if(is.numeric, funs(round(., 3))) %>%
+  filter(term != "(Intercept)") %>% 
+  ggplot(aes(x = term, y = estimate, shape = term, color = term)) + 
+  geom_point() +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high)) +
+  labs(title = "FF 3-Factor Coefficients for Our Portfolio",
+       subtitle = "nothing in this post is investment advice",
+       x = "",
+       y = "coefficient",
+       caption = "data source: Fama French website") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        plot.caption  = element_text(hjust = 0))
+```
+
+# Siliq, variant 1
+
+```{r}
+nb_factors <- 3                                                     # Number of factors
+data_FM <- left_join(data_ml %>%                                    # Join the 2 datasets
+                         dplyr::select(date, stock_id, R1M_Usd), # (with returns...
+                         # filter(stock_id %in% stock_ids_short),     # ... over some stocks)
+                     siliq_factors, 
+                     by = "date") %>% 
+    group_by(stock_id) %>%                                           # Grouping
+    mutate(R1M_Usd = lag(R1M_Usd)) %>%                              # Lag returns
+    ungroup() %>%
+    na.omit() %>%                                                   # Remove missing points
+    pivot_wider(names_from = "stock_id", values_from = "R1M_Usd")
+
+models <- lapply(paste0("`", stock_ids, 
+                        '` ~  MKT_RF + SMB + LMH'),           # Model spec
+                 function(f){ lm(as.formula(f), data = data_FM,           # Call lm(.)
+                                 na.action="na.exclude") %>%       
+                         summary() %>%                                    # Gather the output
+                         "$"(coef) %>%                                    # Keep only coefs
+                         data.frame() %>%                                 # Convert to dataframe
+                         dplyr::select(Estimate)}                         # Keep the estimates
+                 )
+betas <- matrix(unlist(models), ncol = nb_factors + 1, byrow = T) %>%     # Extract the betas
+    data.frame(row.names = stock_ids)                               # Format: row names
+colnames(betas) <- c("Constant", "MKT_RF", "SMB", "LMH")    # Format: col names
+```
+
+
+```{r}
+loadings <- betas %>%                            # Start from loadings (betas)
+    dplyr::select(-Constant) %>%                 # Remove constant
+    data.frame()                                 # Convert to dataframe             
+ret <- returns %>%                               # Start from returns
+    dplyr::select(-date) %>%                     # Keep the returns only
+    data.frame(row.names = returns$date) %>%     # Set row names
+    t()                                          # Transpose
+FM_data <- cbind(loadings, ret)                  # Aggregate both
+```
+
+
+Then we do the second round of regression
+```{r}
+models <- lapply(paste("`", returns$date, "`", ' ~  MKT_RF + SMB + LMH', sep = ""),
+function(f){ lm(as.formula(f), data = FM_data) %>%                        # Call lm(.)
+                         summary() %>%                                    # Gather the output
+                         "$"(coef) %>%                                    # Keep only the coefs
+                         data.frame() %>%                                 # Convert to dataframe
+                         dplyr::select(Estimate)}                         # Keep only estimates
+                 )
+gammas <- matrix(unlist(models), ncol = nb_factors + 1, byrow = T) %>%    # Switch to dataframe
+    data.frame(row.names = returns$date)                                  # & set row names
+colnames(gammas) <- c("Constant", "MKT_RF", "SMB", "LMH")   # Set col names
+```
+
+Visually the gamma
+```{r}
+gammas[2:nrow(gammas),] %>%                                         # Take gammas:
+    # The first row is omitted because the first row of returns is undefined
+    dplyr::select(MKT_RF, SMB, LMH) %>%                             # Select 3 factors
+    bind_cols(date = data_FM$date) %>%                              # Add date
+    gather(key = factor, value = gamma, -date) %>%                  # Put in tidy shape
+    ggplot(aes(x = date, y = gamma, color = factor)) +              # Plot
+    geom_line() + facet_grid( factor~. ) +                          # Lines & facets
+    scale_color_manual(values=c("#F87E1F", "#0570EA", "#F81F40")) #+ # Colors
+    #coord_fixed(980) + theme_light()                                # Fix x/y ratio
+```
+
+Calculate the statistics
+```{r}
+
+library(knitr)
+# Gather the main statistics
+stats <-
+  gammas %>%
+  summarise(mean(MKT_RF), mean(SMB), mean(LMH), sd(MKT_RF), sd(SMB), sd(LMH)) %>%
+  round(3)
+
+stats
+
+# Calculate t-stats
+r <- t.test(gammas$MKT_RF)
+r$statistic
+r <- t.test(gammas$SMB)
+r$statistic
+r <- t.test(gammas$LMH)
+r$statistic
+
+# Calculate coefficients
+cor(gammas$MKT_RF, gammas$SMB)
+cor(gammas$MKT_RF, gammas$LMH)
+cor(gammas$SMB, gammas$LMH)
+```
+
+
+
+# Diliq
+```{r}
+nb_factors <- 3                                                     # Number of factors
+data_FM <- left_join(data_ml %>%                                    # Join the 2 datasets
+                         dplyr::select(date, stock_id, R1M_Usd), # (with returns...
+                         # filter(stock_id %in% stock_ids_short),     # ... over some stocks)
+                     siliq_factors, 
+                     by = "date") %>% 
+    group_by(stock_id) %>%                                           # Grouping
+    mutate(R1M_Usd = lag(R1M_Usd)) %>%                              # Lag returns
+    ungroup() %>%
+    na.omit() %>%                                                   # Remove missing points
+    pivot_wider(names_from = "stock_id", values_from = "R1M_Usd")
+
+models <- lapply(paste0("`", stock_ids, 
+                        '` ~  MKT_RF + HML + LMH'),           # Model spec
+                 function(f){ lm(as.formula(f), data = data_FM,           # Call lm(.)
+                                 na.action="na.exclude") %>%       
+                         summary() %>%                                    # Gather the output
+                         "$"(coef) %>%                                    # Keep only coefs
+                         data.frame() %>%                                 # Convert to dataframe
+                         dplyr::select(Estimate)}                         # Keep the estimates
+                 )
+betas <- matrix(unlist(models), ncol = nb_factors + 1, byrow = T) %>%     # Extract the betas
+    data.frame(row.names = stock_ids)                               # Format: row names
+colnames(betas) <- c("Constant", "MKT_RF", "HML", "LMH")    # Format: col names
+```
+
+
+```{r}
+loadings <- betas %>%                            # Start from loadings (betas)
+    dplyr::select(-Constant) %>%                 # Remove constant
+    data.frame()                                 # Convert to dataframe             
+ret <- returns %>%                               # Start from returns
+    dplyr::select(-date) %>%                     # Keep the returns only
+    data.frame(row.names = returns$date) %>%     # Set row names
+    t()                                          # Transpose
+FM_data <- cbind(loadings, ret)                  # Aggregate both
+```
+
+
+Then we do the second round of regression
+```{r}
+models <- lapply(paste("`", returns$date, "`", ' ~  MKT_RF + HML + LMH', sep = ""),
+function(f){ lm(as.formula(f), data = FM_data) %>%                        # Call lm(.)
+                         summary() %>%                                    # Gather the output
+                         "$"(coef) %>%                                    # Keep only the coefs
+                         data.frame() %>%                                 # Convert to dataframe
+                         dplyr::select(Estimate)}                         # Keep only estimates
+                 )
+gammas <- matrix(unlist(models), ncol = nb_factors + 1, byrow = T) %>%    # Switch to dataframe
+    data.frame(row.names = returns$date)                                  # & set row names
+colnames(gammas) <- c("Constant", "MKT_RF", "HML", "LMH")   # Set col names
+```
+
+Visually the gamma
+```{r}
+gammas[2:nrow(gammas),] %>%                                         # Take gammas:
+    # The first row is omitted because the first row of returns is undefined
+    dplyr::select(MKT_RF, HML, LMH) %>%                             # Select 3 factors
+    bind_cols(date = data_FM$date) %>%                              # Add date
+    gather(key = factor, value = gamma, -date) %>%                  # Put in tidy shape
+    ggplot(aes(x = date, y = gamma, color = factor)) +              # Plot
+    geom_line() + facet_grid( factor~. ) +                          # Lines & facets
+    scale_color_manual(values=c("#F87E1F", "#0570EA", "#F81F40")) #+ # Colors
+    #coord_fixed(980) + theme_light()                                # Fix x/y ratio
+```
+
+Calculate the statistics
+```{r}
+
+library(knitr)
+# Gather the main statistics
+stats <-
+  gammas %>%
+  summarise(mean(MKT_RF), mean(HML), mean(LMH), sd(MKT_RF), sd(HML), sd(LMH)) %>%
+  round(3)
+
+stats
+
+# Calculate t-stats
+r <- t.test(gammas$MKT_RF)
+r$statistic
+r <- t.test(gammas$HML)
+r$statistic
+r <- t.test(gammas$LMH)
+r$statistic
+
+# Calculate coefficients
+cor(gammas$MKT_RF, gammas$HML)
+cor(gammas$MKT_RF, gammas$LMH)
+cor(gammas$HML, gammas$LMH)
+```
+
+
+
+
+
